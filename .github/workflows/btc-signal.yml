@@ -1,0 +1,174 @@
+name: BTC Signal
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  btc-signal:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run BTC Signal
+        uses: actions/github-script@v7
+        env:
+          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          script: |
+            const https = require('https');
+
+            function httpsGet(url) {
+              return new Promise((resolve, reject) => {
+                https.get(url, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+                }).on('error', () => resolve(null));
+              });
+            }
+
+            function httpsGetWithHeaders(url, headers) {
+              return new Promise((resolve, reject) => {
+                const options = { headers };
+                https.get(url, options, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+                }).on('error', () => resolve(null));
+              });
+            }
+
+            function httpsPost(url, body) {
+              return new Promise((resolve, reject) => {
+                const data = JSON.stringify(body);
+                const urlObj = new URL(url);
+                const options = {
+                  hostname: urlObj.hostname,
+                  path: urlObj.pathname + urlObj.search,
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+                };
+                const req = https.request(options, (res) => {
+                  let resp = '';
+                  res.on('data', chunk => resp += chunk);
+                  res.on('end', () => resolve(resp));
+                });
+                req.on('error', () => resolve(null));
+                req.write(data);
+                req.end();
+              });
+            }
+
+            const cgHeaders = { 'accept': 'application/json', 'CG-API-KEY': process.env.COINGLASS_API_KEY };
+
+            const [oiRes, liqRes, krakenOHLC, cgPrice, okxFR] = await Promise.all([
+              httpsGetWithHeaders('https://open-api-v4.coinglass.com/api/futures/open-interest/aggregated-history?symbol=BTC&interval=1h&limit=10', cgHeaders),
+              httpsGetWithHeaders('https://open-api-v4.coinglass.com/api/futures/liquidation/coin-list', cgHeaders),
+              httpsGet('https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=60'),
+              httpsGet('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true'),
+              httpsGet('https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP'),
+            ]);
+
+            const oiArr = (oiRes?.data || []).sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+            const gc = (obj) => Number(obj?.c ?? obj?.close ?? 0);
+            const oiNow = gc(oiArr[oiArr.length - 1]);
+            const oiPrev = gc(oiArr[oiArr.length - 2]);
+            const oiPrev2 = gc(oiArr[oiArr.length - 3]);
+            const oiChange1h = oiPrev > 0 ? ((oiNow - oiPrev) / oiPrev) * 100 : 0;
+            const oiChange2h = oiPrev2 > 0 ? ((oiNow - oiPrev2) / oiPrev2) * 100 : 0;
+
+            const candles = krakenOHLC?.result?.XXBTZUSD || [];
+            const klNow = Number(candles[candles.length - 1]?.[4] || 0);
+            const kl1hAgo = Number(candles[candles.length - 2]?.[4] || 0);
+            const kl4hAgo = Number(candles[candles.length - 5]?.[4] || 0);
+            const prChange1h = kl1hAgo > 0 ? ((klNow - kl1hAgo) / kl1hAgo) * 100 : 0;
+            const prChange4h = kl4hAgo > 0 ? ((klNow - kl4hAgo) / kl4hAgo) * 100 : 0;
+            const currentPrice = Number(cgPrice?.bitcoin?.usd || klNow);
+            const prChange24h = Number(cgPrice?.bitcoin?.usd_24h_change || 0);
+
+            const frNow = Number(okxFR?.data?.[0]?.fundingRate || 0);
+
+            const btcLiq = (liqRes?.data || []).find(x => x.symbol === 'BTC') || {};
+            const longLiq1h = Number(btcLiq.long_liquidation_usd_1h || 0);
+            const shortLiq1h = Number(btcLiq.short_liquidation_usd_1h || 0);
+            const longLiq4h = Number(btcLiq.long_liquidation_usd_4h || 0);
+            const shortLiq4h = Number(btcLiq.short_liquidation_usd_4h || 0);
+            const liqRatio1h = (longLiq1h + shortLiq1h) > 0 ? (shortLiq1h - longLiq1h) / (longLiq1h + shortLiq1h) : 0;
+            const liqRatio4h = (longLiq4h + shortLiq4h) > 0 ? (shortLiq4h - longLiq4h) / (longLiq4h + shortLiq4h) : 0;
+
+            let score = 0;
+            const reasons = [];
+
+            if (oiChange1h > 1.0) { score += 2; reasons.push('OI guclu artis 1s: +' + oiChange1h.toFixed(2) + '%'); }
+            else if (oiChange1h > 0.3) { score += 1; reasons.push('OI artis 1s: +' + oiChange1h.toFixed(2) + '%'); }
+            else if (oiChange1h < -1.0) { score -= 2; reasons.push('OI guclu dusus 1s: ' + oiChange1h.toFixed(2) + '%'); }
+            else if (oiChange1h < -0.3) { score -= 1; reasons.push('OI dusus 1s: ' + oiChange1h.toFixed(2) + '%'); }
+
+            if (oiChange2h > 1.5) { score += 1; reasons.push('OI 2s trend yukari: +' + oiChange2h.toFixed(2) + '%'); }
+            else if (oiChange2h < -1.5) { score -= 1; reasons.push('OI 2s trend asagi: ' + oiChange2h.toFixed(2) + '%'); }
+
+            if (frNow > 0.0001) { score += 1; reasons.push('FR pozitif: ' + (frNow * 100).toFixed(4) + '%'); }
+            else if (frNow < -0.0001) { score -= 1; reasons.push('FR negatif: ' + (frNow * 100).toFixed(4) + '%'); }
+
+            if (prChange1h > 0.5) { score += 2; reasons.push('Fiyat guclu yukari 1s: +' + prChange1h.toFixed(2) + '%'); }
+            else if (prChange1h > 0.1) { score += 1; reasons.push('Fiyat yukari 1s: +' + prChange1h.toFixed(2) + '%'); }
+            else if (prChange1h < -0.5) { score -= 2; reasons.push('Fiyat guclu asagi 1s: ' + prChange1h.toFixed(2) + '%'); }
+            else if (prChange1h < -0.1) { score -= 1; reasons.push('Fiyat asagi 1s: ' + prChange1h.toFixed(2) + '%'); }
+
+            if (prChange4h > 1.5) { score += 1; reasons.push('Fiyat 4s trend yukari: +' + prChange4h.toFixed(2) + '%'); }
+            else if (prChange4h < -1.5) { score -= 1; reasons.push('Fiyat 4s trend asagi: ' + prChange4h.toFixed(2) + '%'); }
+
+            if (prChange24h > 3.0) { score += 1; reasons.push('24s trend guclu yukari: +' + prChange24h.toFixed(2) + '%'); }
+            else if (prChange24h < -3.0) { score -= 1; reasons.push('24s trend guclu asagi: ' + prChange24h.toFixed(2) + '%'); }
+
+            if (liqRatio1h > 0.4) { score += 1; reasons.push('Short liq baskin 1s: $' + (shortLiq1h/1e6).toFixed(2) + 'M vs $' + (longLiq1h/1e6).toFixed(2) + 'M'); }
+            else if (liqRatio1h < -0.4) { score -= 1; reasons.push('Long liq baskin 1s: $' + (longLiq1h/1e6).toFixed(2) + 'M vs $' + (shortLiq1h/1e6).toFixed(2) + 'M'); }
+
+            if (liqRatio4h > 0.4) { score += 1; reasons.push('Short liq baskin 4s: $' + (shortLiq4h/1e6).toFixed(2) + 'M vs $' + (longLiq4h/1e6).toFixed(2) + 'M'); }
+            else if (liqRatio4h < -0.4) { score -= 1; reasons.push('Long liq baskin 4s: $' + (longLiq4h/1e6).toFixed(2) + 'M vs $' + (shortLiq4h/1e6).toFixed(2) + 'M'); }
+
+            const maxScore = 9;
+            let decision = 'NO TRADE';
+            let confidence = 50;
+
+            if (score >= 7) { decision = 'GUCLU LONG'; confidence = Math.min(55 + Math.round((score / maxScore) * 40), 95); }
+            else if (score >= 4) { decision = 'LONG'; confidence = Math.min(50 + Math.round((score / maxScore) * 40), 90); }
+            else if (score >= 2) { decision = 'ZAYIF LONG'; confidence = 50 + Math.round((score / maxScore) * 25); }
+            else if (score <= -7) { decision = 'GUCLU SHORT'; confidence = Math.min(55 + Math.round((Math.abs(score) / maxScore) * 40), 95); }
+            else if (score <= -4) { decision = 'SHORT'; confidence = Math.min(50 + Math.round((Math.abs(score) / maxScore) * 40), 90); }
+            else if (score <= -2) { decision = 'ZAYIF SHORT'; confidence = 50 + Math.round((Math.abs(score) / maxScore) * 25); }
+
+            if (decision === 'NO TRADE') { console.log('NO TRADE'); return; }
+
+            const fmt = (n) => (n >= 0 ? '+' : '') + n.toFixed(2);
+            const zaman = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
+
+            const message =
+              'BTC SINYAL - ' + decision + '\n' +
+              '------------------------------\n' +
+              'Fiyat   : $' + currentPrice.toLocaleString() + '\n' +
+              'Guven   : %' + confidence + '\n' +
+              'Skor    : ' + (score > 0 ? '+' : '') + score + ' / ' + maxScore + '\n' +
+              '------------------------------\n' +
+              'OI   1s : ' + fmt(oiChange1h) + '%\n' +
+              'OI   2s : ' + fmt(oiChange2h) + '%\n' +
+              'Fiyat 1s: ' + fmt(prChange1h) + '%\n' +
+              'Fiyat 4s: ' + fmt(prChange4h) + '%\n' +
+              'Fiyat24s: ' + fmt(prChange24h) + '%\n' +
+              'F.Rate  : ' + (frNow * 100).toFixed(4) + '%\n' +
+              'Liq 1s  : Long $' + (longLiq1h/1e6).toFixed(2) + 'M | Short $' + (shortLiq1h/1e6).toFixed(2) + 'M\n' +
+              'Liq 4s  : Long $' + (longLiq4h/1e6).toFixed(2) + 'M | Short $' + (shortLiq4h/1e6).toFixed(2) + 'M\n' +
+              '------------------------------\n' +
+              'Nedenler:\n' +
+              (reasons.length > 0 ? reasons.join('\n') : 'Kosul saglanamadi') +
+              '\n\n' + zaman;
+
+            await httpsPost(
+              'https://api.telegram.org/bot' + process.env.TELEGRAM_TOKEN + '/sendMessage',
+              { chat_id: process.env.TELEGRAM_CHAT_ID, text: message }
+            );
+
+            console.log('BTC sinyal gönderildi: ' + decision);
