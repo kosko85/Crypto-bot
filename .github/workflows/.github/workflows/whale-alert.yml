@@ -1,0 +1,121 @@
+name: Crypto Whale Alert
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  whale-alert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run Whale Alert
+        uses: actions/github-script@v7
+        env:
+          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          script: |
+            const https = require('https');
+
+            function httpsGet(url, headers) {
+              return new Promise((resolve, reject) => {
+                https.get(url, { headers }, (res) => {
+                  let data = '';
+                  res.on('data', chunk => data += chunk);
+                  res.on('end', () => resolve(JSON.parse(data)));
+                }).on('error', reject);
+              });
+            }
+
+            function httpsPost(url, body) {
+              return new Promise((resolve, reject) => {
+                const data = JSON.stringify(body);
+                const options = {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(data)
+                  }
+                };
+                const req = https.request(url, options, (res) => {
+                  let resp = '';
+                  res.on('data', chunk => resp += chunk);
+                  res.on('end', () => resolve(JSON.parse(resp)));
+                });
+                req.on('error', reject);
+                req.write(data);
+                req.end();
+              });
+            }
+
+            const headers = {
+              'accept': 'application/json',
+              'CG-API-KEY': process.env.COINGLASS_API_KEY
+            };
+
+            const alertRes = await httpsGet(
+              'https://open-api-v4.coinglass.com/api/hyperliquid/whale-alert',
+              headers
+            );
+
+            const posRes = await httpsGet(
+              'https://open-api-v4.coinglass.com/api/hyperliquid/whale-position',
+              headers
+            );
+
+            const whales = alertRes.data;
+            const positions = posRes.data;
+
+            const fiveMinsAgo = Date.now() - 5 * 60 * 1000;
+            const recent = whales?.filter(w => Number(w.create_time) > fiveMinsAgo);
+
+            let message = '';
+
+            if (recent && recent.length > 0) {
+              message += '🐋 *Hyperliquid Balina Alarmı!*\n\n';
+              for (const w of recent.slice(0, 5)) {
+                const action = w.position_action === 1 ? '🟢 POZİSYON AÇTI' : '🔴 POZİSYON KAPATTI';
+                message += `${action} *${w.symbol}*\n`;
+                message += `💰 $${Number(w.position_value_usd).toLocaleString()}\n`;
+                message += `📊 Boyut: ${w.position_size}\n`;
+                message += `💵 Giriş: $${w.entry_price}\n`;
+                message += `⏰ ${new Date(Number(w.create_time)).toLocaleTimeString('tr-TR')}\n\n`;
+              }
+            }
+
+            if (positions && positions.length > 0) {
+              message += '📊 *En Büyük Pozisyonlar:*\n\n';
+              for (const p of positions.slice(0, 3)) {
+                const side = p.position_size > 0 ? '🟢 LONG' : '🔴 SHORT';
+                const pnlNum = Number(p.unrealized_pnl);
+                const pnl = pnlNum > 0
+                  ? `+$${pnlNum.toLocaleString()}`
+                  : `-$${Math.abs(pnlNum).toLocaleString()}`;
+                message += `${side} *${p.symbol}*\n`;
+                message += `💰 $${Number(p.position_value_usd).toLocaleString()}\n`;
+                message += `📈 Kaldıraç: ${p.leverage}x\n`;
+                message += `💵 Giriş: $${p.entry_price}\n`;
+                message += `💹 PNL: ${pnl}\n\n`;
+              }
+            }
+
+            if (!message) {
+              console.log('Veri yok.');
+              return;
+            }
+
+            await httpsPost(
+              `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`,
+              {
+                chat_id: process.env.TELEGRAM_CHAT_ID,
+                text: message,
+                parse_mode: 'Markdown'
+              }
+            );
+
+            console.log('Mesaj gönderildi!');
+
+
