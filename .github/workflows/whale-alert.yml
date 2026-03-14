@@ -1,72 +1,151 @@
-import axios from "axios";
+name: Balina Uyarısı
 
-export default defineComponent({
-  async run({ steps, $ }) {
-    const headers = {
-      "accept": "application/json",
-      "CG-API-KEY": "BURAYA_API_KEY"
-    };
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
-    // 1. Balina Alarmı
-    const alertRes = await axios.get(
-      "https://open-api-v4.coinglass.com/api/hyperliquid/whale-alert",
-      { headers }
-    );
+jobs:
+  balina-kontrol:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Balina Kontrolü
+        run: |
+          node << 'EOF'
+          const https = require('https');
 
-    // 2. Whale Pozisyonları
-    const posRes = await axios.get(
-      "https://open-api-v4.coinglass.com/api/hyperliquid/whale-position",
-      { headers }
-    );
+          async function fetchData(url, apiKey) {
+            return new Promise((resolve, reject) => {
+              const options = {
+                headers: {
+                  'accept': 'application/json',
+                  'CG-API-KEY': apiKey
+                }
+              };
+              https.get(url, options, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(JSON.parse(data)));
+              }).on('error', reject);
+            });
+          }
 
-    const whales = alertRes.data.data;
-    const positions = posRes.data.data;
+          async function sendTelegram(token, chatId, message) {
+            return new Promise((resolve, reject) => {
+              const body = JSON.stringify({
+                chat_id: chatId,
+                text: message,
+                parse_mode: 'Markdown'
+              });
+              const options = {
+                hostname: 'api.telegram.org',
+                path: `/bot${token}/sendMessage`,
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(body)
+                }
+              };
+              const req = https.request(options, resolve);
+              req.on('error', reject);
+              req.write(body);
+              req.end();
+            });
+          }
 
-    const fiveMinsAgo = Date.now() - 5 * 60 * 1000;
-    const recent = whales?.filter(w => Number(w.create_time) > fiveMinsAgo);
+          (async () => {
+            const API_KEY = process.env.COINGLASS_API_KEY;
+            const TOKEN = process.env.TELEGRAM_TOKEN;
+            const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-    let message = "";
+            // 1. Balina Alarmı
+            const alertData = await fetchData(
+              'https://open-api-v4.coinglass.com/api/hyperliquid/whale-alert',
+              API_KEY
+            );
 
-    // Balina Alarmları
-    if (recent && recent.length > 0) {
-      message += "🐋 *Hyperliquid Balina Alarmı!*\n\n";
-      for (const w of recent.slice(0, 5)) {
-        const action = w.position_action === 1 ? "🟢 POZİSYON AÇTI" : "🔴 POZİSYON KAPATTI";
-        message += `${action} *${w.symbol}*\n`;
-        message += `💰 $${Number(w.position_value_usd).toLocaleString()}\n`;
-        message += `📊 Boyut: ${w.position_size}\n`;
-        message += `💵 Giriş: $${w.entry_price}\n`;
-        message += `⏰ ${new Date(w.create_time).toLocaleTimeString("tr-TR")}\n\n`;
-      }
-    }
+            // 2. Whale Pozisyonları
+            const posData = await fetchData(
+              'https://open-api-v4.coinglass.com/api/hyperliquid/whale-position',
+              API_KEY
+            );
 
-    // Whale Pozisyonları
-    if (positions && positions.length > 0) {
-      message += "📊 *En Büyük Pozisyonlar:*\n\n";
-      for (const p of positions.slice(0, 3)) {
-        const side = p.position_size > 0 ? "🟢 LONG" : "🔴 SHORT";
-        const pnl = Number(p.unrealized_pnl) > 0 
-          ? `+$${Number(p.unrealized_pnl).toLocaleString()}` 
-          : `-$${Math.abs(Number(p.unrealized_pnl)).toLocaleString()}`;
-        message += `${side} *${p.symbol}*\n`;
-        message += `💰 $${Number(p.position_value_usd).toLocaleString()}\n`;
-        message += `📈 Kaldıraç: ${p.leverage}x\n`;
-        message += `💵 Giriş: $${p.entry_price}\n`;
-        message += `💹 PNL: ${pnl}\n\n`;
-      }
-    }
+            const whales = alertData.data || [];
+            const positions = posData.data || [];
 
-    if (!message) message = "✅ Bot çalışıyor, balina yok!";
+            // En büyük balinayı bul
+            const biggestWhale = positions.sort((a, b) => 
+              Number(b.position_value_usd) - Number(a.position_value_usd)
+            )[0];
 
-    await axios.post(
-      `https://api.telegram.org/botBURAYA_TOKEN/sendMessage`,
-      {
-        chat_id: "BURAYA_CHAT_ID",
-        text: message,
-        parse_mode: "Markdown"
-      }
-    );
+            // 3. En büyük balinanın cüzdanını takip et
+            let walletMessage = '';
+            if (biggestWhale?.user) {
+              const walletData = await fetchData(
+                `https://open-api-v4.coinglass.com/api/hyperliquid/wallet-positions-by-address?address=${biggestWhale.user}`,
+                API_KEY
+              );
+              const wallet = walletData.data;
+              if (wallet) {
+                walletMessage += `\n🔍 *En Büyük Balina Cüzdanı:*\n`;
+                walletMessage += `👤 \`${biggestWhale.user?.slice(0,10)}...\`\n`;
+                walletMessage += `💼 Hesap Değeri: $${Number(wallet.margin_summary?.account_value).toLocaleString()}\n`;
+                walletMessage += `📊 Toplam Pozisyon: $${Number(wallet.margin_summary?.total_ntl_pos).toLocaleString()}\n`;
+                if (wallet.asset_positions?.length > 0) {
+                  for (const ap of wallet.asset_positions.slice(0, 3)) {
+                    const p = ap.position;
+                    const side = Number(p.szi) > 0 ? '🟢 LONG' : '🔴 SHORT';
+                    walletMessage += `\n${side} *${p.coin}*\n`;
+                    walletMessage += `💰 $${Number(p.position_value).toLocaleString()}\n`;
+                    walletMessage += `💹 PNL: $${Number(p.unrealized_pnl).toLocaleString()}\n`;
+                  }
+                }
+              }
+            }
 
-    return "Gönderildi!";
-  }
-});
+            const fiveMinsAgo = Date.now() - 5 * 60 * 1000;
+            const recent = whales.filter(w => Number(w.create_time) > fiveMinsAgo);
+
+            let message = '';
+
+            // Balina Alarmları
+            if (recent.length > 0) {
+              message += '🐋 *Hyperliquid Balina Alarmı!*\n\n';
+              for (const w of recent.slice(0, 5)) {
+                const action = w.position_action === 1 ? '🟢 POZİSYON AÇTI' : '🔴 POZİSYON KAPATTI';
+                message += `${action} *${w.symbol}*\n`;
+                message += `💰 $${Number(w.position_value_usd).toLocaleString()}\n`;
+                message += `💵 Giriş: $${w.entry_price}\n`;
+                message += `⏰ ${new Date(Number(w.create_time)).toLocaleTimeString('tr-TR')}\n\n`;
+              }
+            }
+
+            // En Büyük Pozisyonlar
+            if (positions.length > 0) {
+              message += '📊 *En Büyük Pozisyonlar:*\n\n';
+              for (const p of positions.slice(0, 3)) {
+                const side = Number(p.position_size) > 0 ? '🟢 LONG' : '🔴 SHORT';
+                const pnl = Number(p.unrealized_pnl) > 0
+                  ? `+$${Number(p.unrealized_pnl).toLocaleString()}`
+                  : `-$${Math.abs(Number(p.unrealized_pnl)).toLocaleString()}`;
+                message += `${side} *${p.symbol}*\n`;
+                message += `💰 $${Number(p.position_value_usd).toLocaleString()}\n`;
+                message += `📈 Kaldıraç: ${p.leverage}x\n`;
+                message += `💵 Giriş: $${p.entry_price}\n`;
+                message += `💹 PNL: ${pnl}\n\n`;
+              }
+            }
+
+            // En Büyük Balina Cüzdanı
+            message += walletMessage;
+
+            if (!message) message = '✅ Bot çalışıyor, balina yok!';
+
+            await sendTelegram(TOKEN, CHAT_ID, message);
+            console.log('Gönderildi!');
+          })();
+          EOF
+        env:
+          COINGLASS_API_KEY: ${{ secrets.COINGLASS_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
