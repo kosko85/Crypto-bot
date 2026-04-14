@@ -1,4 +1,4 @@
-name: BTC Signal
+name: btc-signal.yml
 
 on:
   schedule:
